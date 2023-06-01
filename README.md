@@ -18,7 +18,6 @@ The stack consists of three services, running as containers: -
 - a Postgres database (note: this used to be MySQL)
 - a neo4j graph database
 - the fraglaysis stack
-- a transient data loader container
 
 The stack is formed from code resident in a number of repositories.
 Begin by forking repositories you anticipate editing (although you really want
@@ -31,7 +30,6 @@ The repositories are:
 - [xchem/fragalysis-frontend](https://github.com/xchem/fragalysis-frontend)
 - [xchem/fragalysis-backend](https://github.com/xchem/fragalysis-backend)
 - [xchem/fragalysis-stack](https://github.com/xchem/fragalysis-stack)
-- [xchem/fragalysis-loader](https://github.com/xchem/fragalysis-loader)
 
 ### Prerequisites
 
@@ -55,14 +53,12 @@ You can clone original `xchem` repositories or your forked e.g. `m2ms` and check
 ```
 git clone https://github.com/xchem/fragalysis-backend.git
 git clone https://github.com/xchem/fragalysis-frontend.git
-git clone https://github.com/xchem/fragalysis-loader.git
 git clone https://github.com/InformaticsMatters/dls-fragalysis-stack-openshift.git
 ```
 Note: 
 To successful build, it should exist following directories from repository cloning.
 Frontend is also important, because DJANGO server will serve this directory!
 ```$xslt
-fragalysis/fragalysis-loader/
 fragalysis/fragalysis-frontend/
 fragalysis/fragalysis-backend/
 fragalysis/dls-fragalysis-stack-openshift/
@@ -83,13 +79,45 @@ mkdir -p data/postgre/data
 ```
 **4.Populating database** 
 
-
 Copy to `fragalysis/data/input/django_data/EXAMPLE` your PDB data, before you can launch the application.
 
 If not exists file `fragalysis/data/input/django_data/EXAMPLE/TARGET_LIST` create it and content with list of your data, for example:
 ```
 Mpro, NUDT7A,...
 ```
+
+## Making database migrations
+The best approach is to spin-up the development stack (locally) using
+`docker-compose` and then shell into the Django (stack). For example,
+to make new migrations called "add_job_request_start_and_finish_times"
+for the viewer's models run the following: -
+
+    docker-compose up -d
+    docker-compose exec stack bash
+
+Then from within the stack...
+
+    python manage.py makemigrations viewer --name "add_job_request_start_and_finish_times"
+
+Exit the container and tear-down the deployemnt: -
+
+    docker-compose down
+
+## Pre-commit hooks
+The project uses [pre-commit] to enforce linting of files prior to committing
+them to the upstream repository.
+
+To get started review the pre-commit utility and then set-up your local clone
+by following the **Installation** and **Quick Start** sections of the
+pre-commit documentation.
+
+Ideally from a Python environment...
+
+    pip install --upgrade pip
+    pip install -r build-requirements.txt
+    pre-commit install -t commit-msg -t pre-commit
+
+Now the project's rules will run on every commit.
 
 ## Start
 Start `Fragalysis stack` (All infrastructure - databases + populating data)
@@ -177,3 +205,17 @@ or adding the following line to the AWX template:
 ```
     stack_backend_sentry_dsn: https://27fa0675f555431aa02ca552e93d8cfb@o194333.ingest.sentry.io/1298290
 ```
+
+### Design Documents
+
+As the application evolves several design documents have been written detailing improvements. These may be useful
+for background reading on why decisions have been made.
+
+The documents will be stored in the /design_docs folder in the repo. Current docs are listed below:
+- [Fragalysis Discourse Design](design_docs/Fragalysis_Discourse_v0.2.pdf)
+- [Fragalysis Tags Design V1.0](design_docs/Fragalysis_Tags_Design_V1.0.pdf)
+- [Fragalysis Design #651 Fix Data Download V2.0](design_docs/Fragalysis_Design_651_Fix_Data_Download_V2.0.pdf)
+- [Fragalysis Job Launcher V1.0](design_docs/Fragalysis_Job_Launcher_V1.0.pdf)
+- [Fragalysis Job Launcher V2.0](design_docs/Fragalysis_Job_Launcher_Phase2_V1.0.pdf)
+
+[pre-commit]: https://pre-commit.com

@@ -1,7 +1,6 @@
 import os
 from frag.network.decorate import get_3d_vects_for_mol, get_vect_indices_for_mol
 from frag.network.query import get_full_graph
-#L+
 from urllib.parse import urljoin
 
 from api.utils import draw_mol
@@ -23,11 +22,18 @@ from viewer.models import (
     NumericalScoreValues,
     ScoreDescription,
     File,
-    TextScoreValues
+    TextScoreValues,
+    TagCategory,
+    MoleculeTag,
+    SessionProjectTag,
+    JobFileTransfer,
+    JobRequest
 )
+from viewer.utils import get_https_host
+
+from scoring.models import MolGroup
 
 from django.contrib.auth.models import User
-#L+
 from django.conf import settings
 
 from rest_framework import serializers
@@ -83,6 +89,39 @@ def get_protein_sequences(pdb_block):
     return sequence_list
 
 
+def protein_sequences(obj):
+    """Common enabler code for Target-related serializers
+    """
+    proteins = obj.protein_set.filter()
+    protein_file = None
+    for protein in proteins:
+        if protein.pdb_info:
+            if not os.path.isfile(protein.pdb_info.path):
+                continue
+            protein_file = protein.pdb_info
+            break
+    if not protein_file:
+        return [{'chain': '', 'sequence': ''}]
+
+    protein_file.open(mode='r')
+    pdb_block = protein_file.read()
+    protein_file.close()
+
+    sequences = get_protein_sequences(pdb_block)
+    return sequences
+
+
+def template_protein(obj):
+    """Common enabler code for Target-related serializers
+    """
+
+    proteins = obj.protein_set.filter()
+    for protein in proteins:
+        if protein.pdb_info:
+            return protein.pdb_info.url
+    return "NOT AVAILABLE"
+
+
 class TargetSerializer(serializers.ModelSerializer):
     template_protein = serializers.SerializerMethodField()
     zip_archive = serializers.SerializerMethodField()
@@ -90,59 +129,27 @@ class TargetSerializer(serializers.ModelSerializer):
     sequences = serializers.SerializerMethodField()
 
     def get_template_protein(self, obj):
-        proteins = obj.protein_set.filter()
-        for protein in proteins:
-            if protein.pdb_info:
-                return protein.pdb_info.url
-        return "NOT AVAILABLE"
+        return template_protein(obj)
 
     def get_zip_archive(self, obj):
-        request = self.context["request"]
-        # This is to map links to HTTPS to avoid Mixed Content warnings from Chrome browsers
-        # SECURE_PROXY_SSL_HEADER is referenced because it is used in redirecting URLs - if
-        # it is changed it may affect this code.
-        # Using relative links will probably also work, but This workaround allows both the
-        # 'download structures' button and the DRF API call to work.
         # The if-check is because the filefield in target has null=True.
         # Note that this link will not work on local
-        https_host = settings.SECURE_PROXY_SSL_HEADER[1] + '://' + request.get_host()
         if hasattr(obj, 'zip_archive') and obj.zip_archive.name:
-            return urljoin(https_host, obj.zip_archive.url)
-        else:
-            return
+            return urljoin(get_https_host(self.context["request"]), obj.zip_archive.url)
+        return
 
     def get_metadata(self, obj):
-        request = self.context["request"]
-        # This is to map links to HTTPS to avoid Mixed Content warnings from Chrome browsers
-        # See above for details.
-        https_host = settings.SECURE_PROXY_SSL_HEADER[1] + '://' + request.get_host()
         if hasattr(obj, 'metadata') and obj.metadata.name:
-            return urljoin(https_host, obj.metadata.url)
-        else:
-            return
+            return urljoin(get_https_host(self.context["request"]), obj.metadata.url)
+        return
 
     def get_sequences(self, obj):
-        proteins = obj.protein_set.filter()
-        protein_file = None
-        for protein in proteins:
-            if protein.pdb_info:
-                if not os.path.isfile(protein.pdb_info.path):
-                    continue
-                protein_file = protein.pdb_info
-                break
-        if not protein_file:
-            return [{'chain': '', 'sequence': ''}]
-
-        protein_file.open(mode='r')
-        pdb_block = protein_file.read()
-        protein_file.close()
-
-        sequences = get_protein_sequences(pdb_block)
-        return sequences
+        return protein_sequences(obj)
 
     class Meta:
         model = Target
-        fields = ("id", "title", "project_id", "protein_set", "template_protein", "metadata", "zip_archive", "sequences")
+        fields = ("id", "title", "project_id", "protein_set", "default_squonk_project",
+                  "template_protein", "metadata", "zip_archive", "upload_status", "sequences")
 
 
 class CompoundSerializer(serializers.ModelSerializer):
@@ -411,9 +418,18 @@ class ActionTypeSerializer(serializers.ModelSerializer):
 class SessionProjectReadSerializer(serializers.ModelSerializer):
     target = TargetSerializer(read_only=True)
     author = UserSerializer(read_only=True)
+    # This is for the new tags functionality. The old tags field is left here for backwards
+    # compatibility
+    session_project_tags = serializers.SerializerMethodField()
+
+    def get_session_project_tags(self, obj):
+        sp_tags = SessionProjectTag.objects.filter(session_projects=obj.id).values()
+        return sp_tags
+
     class Meta:
         model = SessionProject
-        fields = '__all__'
+        fields = ('id', 'title', 'init_date', 'description',
+                  'target', 'author', 'tags', 'session_project_tags')
 
 
 # (POST, PUT, PATCH)
@@ -437,15 +453,16 @@ class SnapshotReadSerializer(serializers.ModelSerializer):
     session_project  = SessionProjectWriteSerializer()
     class Meta:
         model = Snapshot
-        fields = ('id', 'type', 'title', 'author', 'description', 'created', 'data', 'session_project', 'parent', 'children')
+        fields = ('id', 'type', 'title', 'author', 'description', 'created', 'data',
+                  'session_project', 'parent', 'children', 'additional_info')
 
 
 # (POST, PUT, PATCH)
 class SnapshotWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Snapshot
-        fields = ('id', 'type', 'title', 'author', 'description', 'created', 'data', 'session_project', 'parent', 'children')
-## End of Session Project
+        fields = ('id', 'type', 'title', 'author', 'description', 'created', 'data',
+                  'session_project', 'parent', 'children', 'additional_info')
 
 
 # (GET, POST, PUT, PATCH)
@@ -454,13 +471,8 @@ class SnapshotActionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = SnapshotActions
         fields = '__all__'
-
-
 ## End of Session Project
-# class FileSerializer(serializers.ModelSerializer):
-#     class Meta:
-#         model = ComputedMolecule
-#         fields = "__all__"
+
 
 class ComputedSetSerializer(serializers.ModelSerializer):
     class Meta:
@@ -556,10 +568,188 @@ class DiscoursePostWriteSerializer(serializers.Serializer):
     post_title = serializers.CharField(max_length=200)
     post_content = serializers.CharField(max_length=2000)
     post_tags = serializers.JSONField()
-
 # End of Discourse Serializer
+
 
 # Serializer Class for DictToCsv API
 class DictToCsvSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=200)
     dict = serializers.DictField()
+
+
+# Start of Serializers for Tags
+class TagCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TagCategory
+        fields = '__all__'
+
+
+class MoleculeTagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MoleculeTag
+        fields = '__all__'
+
+
+class SessionProjectTagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SessionProjectTag
+        fields = '__all__'
+
+
+class TargetMoleculesSerializer(serializers.ModelSerializer):
+    template_protein = serializers.SerializerMethodField()
+    zip_archive = serializers.SerializerMethodField()
+    metadata = serializers.SerializerMethodField()
+    sequences = serializers.SerializerMethodField()
+    molecules  = serializers.SerializerMethodField()
+    tags_info = serializers.SerializerMethodField()
+    tag_categories = serializers.SerializerMethodField()
+
+    def get_template_protein(self, obj):
+        return template_protein(obj)
+
+    def get_zip_archive(self, obj):
+        # The if-check is because the filefield in target has null=True.
+        # Note that this link will not work on local
+        if hasattr(obj, 'zip_archive') and obj.zip_archive.name:
+            return urljoin(get_https_host(self.context["request"]), obj.zip_archive.url)
+        return
+
+    def get_metadata(self, obj):
+        if hasattr(obj, 'metadata') and obj.metadata.name:
+            return urljoin(get_https_host(self.context["request"]), obj.metadata.url)
+        return
+
+    def get_sequences(self, obj):
+        return protein_sequences(obj)
+
+    def get_molecules(self, obj):
+        mols = Molecule.objects.filter(prot_id__target_id=obj.id)
+        molecules = []
+        for mol in mols:
+            mol_data = {
+                'id': mol.id,
+                'smiles': mol.smiles,
+                'cmpd_id': mol.cmpd_id_id,
+                'prot_id': mol.prot_id_id,
+                'protein_code': mol.prot_id.code,
+                "mol_type": mol.mol_type,
+                "molecule_protein": mol.prot_id.pdb_info.url,
+                "lig_id": mol.lig_id,
+                "chain_id": mol.chain_id,
+                'sdf_info': mol.sdf_info,
+                'x_com': mol.x_com,
+                'y_com': mol.y_com,
+                'z_com': mol.z_com,
+                'mw': round(mol.cmpd_id.mol_wt, 2),
+                'logp': round(mol.cmpd_id.mol_log_p, 2),
+                'tpsa': round(mol.cmpd_id.tpsa, 2),
+                'ha': mol.cmpd_id.heavy_atom_count,
+                'hacc': mol.cmpd_id.num_h_acceptors,
+                'hdon': mol.cmpd_id.num_h_donors,
+                'rots': mol.cmpd_id.num_rot_bonds,
+                'rings': mol.cmpd_id.ring_count,
+                'velec': mol.cmpd_id.num_val_electrons
+            }
+            mol_tags_set = \
+                [mt['id'] for mt in MoleculeTag.objects.filter(molecules=mol.id).values()]
+            mol_dict = {'data': mol_data, 'tags_set': mol_tags_set}
+            molecules.append(mol_dict)
+
+        return molecules
+
+    def get_tags_info(self, obj):
+        tags = MoleculeTag.objects.filter(target_id=obj.id)
+        tags_info = []
+        for tag in tags:
+            tag_data = MoleculeTag.objects.filter(id=tag.id).values()
+            tag_coords = \
+                MolGroup.objects.filter(id=tag.mol_group_id).values('x_com','y_com','z_com' )
+            tag_dict = {'data': tag_data, 'coords': tag_coords}
+            tags_info.append(tag_dict)
+
+        return tags_info
+
+    def get_tag_categories(self, obj):
+        tag_categories = TagCategory.objects.filter(moleculetag__target_id=obj.id).distinct().\
+            values()
+        return tag_categories
+
+    class Meta:
+        model = Target
+        fields = ("id", "title", "project_id", "default_squonk_project", "template_protein",
+                  "metadata", "zip_archive", "upload_status", "sequences",
+                  "molecules", "tags_info", "tag_categories")
+# Serializers for Tags - End
+
+
+# Serializer Class for DownloadStructures API
+class DownloadStructuresSerializer(serializers.Serializer):
+    target_name = serializers.CharField(max_length=200)
+    proteins = serializers.CharField(max_length=5000)
+    pdb_info = serializers.BooleanField(default=False)
+    bound_info = serializers.BooleanField(default=False)
+    cif_info = serializers.BooleanField(default=False)
+    mtz_info = serializers.BooleanField(default=False)
+    diff_info = serializers.BooleanField(default=False)
+    event_info = serializers.BooleanField(default=False)
+    sigmaa_info = serializers.BooleanField(default=False)
+    sdf_info = serializers.BooleanField(default=False)
+    single_sdf_file = serializers.BooleanField(default=False)
+    trans_matrix_info = serializers.BooleanField(default=False)
+    metadata_info = serializers.BooleanField(default=False)
+    smiles_info = serializers.BooleanField(default=False)
+    static_link = serializers.BooleanField(default=False)
+    file_url = serializers.CharField(max_length=200)
+
+
+# Start of Serializers for Squonk Jobs
+# (GET)
+class JobFileTransferReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobFileTransfer
+        fields = '__all__'
+
+
+# (POST, PUT, PATCH)
+class JobFileTransferWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobFileTransfer
+        fields = ("snapshot", "target", "squonk_project",
+                  "proteins", "compounds")
+
+
+# (GET)
+class JobRequestReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobRequest
+        fields = '__all__'
+
+
+# (POST, PUT, PATCH)
+class JobRequestWriteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobRequest
+        fields = ("squonk_job_name", "snapshot", "target", "squonk_project",
+                  "squonk_job_spec")
+
+
+# Contains output fields from Fragalysis
+class JobCallBackReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobRequest
+        fields = ("job_status", "job_status_datetime",
+                  "squonk_job_name", "squonk_job_spec", "upload_status")
+
+
+# Contains the input fields from Squonk
+class JobCallBackWriteSerializer(serializers.ModelSerializer):
+    SQUONK_STATUS = ['PENDING', 'STARTED', 'SUCCESS', 'FAILURE', 'RETRY', 'REVOKED']
+    job_status = serializers.ChoiceField(choices=SQUONK_STATUS, default="PENDING")
+    state_transition_time = serializers.DateTimeField(source='job_status_datetime')
+
+    class Meta:
+        model = JobRequest
+        fields = ("job_status", "state_transition_time")
+
+# End of Serializers for Squonk Jobs

@@ -5,9 +5,21 @@ This was originally sourced from the code in the fragment-loader repo:
 loaders.py
 functions.py
 """
+import logging
 import sys, json, os, glob, shutil
+import datetime
+
 from django.contrib.auth.models import User
-from viewer.models import Target, Protein, Molecule, Compound, Project, ComputedMolecule
+from viewer.models import (
+    Target,
+    Protein,
+    Molecule,
+    Compound,
+    Project,
+    ComputedMolecule,
+    MoleculeTag,
+    TagCategory
+)
 from hypothesis.models import (
     Vector3D,
     Vector,
@@ -26,12 +38,16 @@ from rdkit.Chem import Lipinski, AllChem
 from scoring.models import MolGroup,MolAnnotation
 from frag.alysis.run_clustering import run_lig_cluster
 from frag.network.decorate import get_3d_vects_for_mol
-from loader.config import get_dict
+from viewer.target_set_config import get_dict
 import numpy as np
 import pandas as pd
 
 from django.conf import settings
 from django.core.files.storage import default_storage
+
+logger = logging.getLogger(__name__)
+
+_reactions = None
 
 
 # Contribution to the RDKit from Hans de Winter
@@ -58,9 +74,6 @@ def _InitialiseNeutralisationReactions():
         ("[$([N-]C=O)]", "N"),
     )
     return [(Chem.MolFromSmarts(x), Chem.MolFromSmiles(y, False)) for x, y in patts]
-
-
-_reactions = None
 
 
 def neutralise_charges(smiles, reactions=None):
@@ -134,13 +147,13 @@ def get_path_or_none(xtal_path, xtal, dict_input, dict_key):
     if dict_key in dict_input:
         suffix = dict_input[dict_key]
     else:
-        print("Key - " + dict_key + " not in dictionary.")
+        logger.warning("Key - '%s' not in dictionary", dict_key)
         return None
     path = os.path.join(xtal_path, xtal + suffix)
     if os.path.isfile(path):
         return path
     else:
-        print("Path - " + path + " not found.")
+        logger.warning("Path - '%s' not found", path)
         return None
 
 
@@ -151,7 +164,7 @@ def get_create_target(title):
     :return: the created target
     """
     new_target = Target.objects.get_or_create(title=title)
-    print('Target created = ' + str(Target.objects.get_or_create(title=title)[1]))
+    logger.debug("Target created new_target='%s'", Target.objects.get_or_create(title=title)[1])
     return new_target[0]
 
 
@@ -173,13 +186,15 @@ def add_prot(code, target, xtal_path, xtal, input_dict):
     proteins = Protein.objects.filter(code__contains=code_first_part)
     if proteins.exists():
         new_prot = proteins.first()
+        logger.debug("Protein exists='%s'", new_prot[1])
     else:
         new_prot = Protein.objects.get_or_create(code=code, target_id=target)
-        print('Protein created = ' + str(new_prot[1]))
+        logger.debug("Protein created new_prot='%s'", new_prot[1])
         new_prot = new_prot[0]
 
     new_prot.apo_holo = True
 
+    # Check filepaths of all associated files.
     filepaths = {
         'pdb_info': ('pdbs', get_path_or_none(xtal_path, xtal, input_dict, "APO")),
         'bound_info': ('bound', get_path_or_none(xtal_path, xtal, input_dict, "BOUND")),
@@ -189,6 +204,9 @@ def add_prot(code, target, xtal_path, xtal, input_dict):
         'sigmaa_info': ('maps', get_path_or_none(xtal_path, xtal, input_dict, "SIGMAA")),
         'diff_info': ('maps', get_path_or_none(xtal_path, xtal, input_dict, "DIFF")),
         'event_info': ('maps', get_path_or_none(xtal_path, xtal, input_dict, "EVENT")),
+        'trans_matrix_info': ('trans', get_path_or_none(xtal_path, xtal, input_dict, "TRANS")),
+        'pdb_header_info': ('pdbs', get_path_or_none(xtal_path, xtal, input_dict, "HEADER")),
+        'apo_desolve_info': ('pdbs', get_path_or_none(xtal_path, xtal, input_dict, "DESOLV")),
     }
 
     to_unpack = {k: v for k, v in filepaths.items() if v[1] is not None}
@@ -196,7 +214,6 @@ def add_prot(code, target, xtal_path, xtal, input_dict):
     for key in to_unpack.keys():
         save_path = os.path.join(to_unpack[key][0], to_unpack[key][1].split('/')[-1])
         path = default_storage.save(save_path, open(to_unpack[key][1], 'rb'))
-
         setattr(new_prot, key, path)
 
     new_prot.save()
@@ -233,19 +250,24 @@ def calc_cpd(cpd_object, mol, projects):
         inchi = Chem.MolToInchi(tmp_mol)
 
     cpd_object.smiles = smiles
-    if len(smiles) > Compound._meta.get_field("smiles").max_length:
-        print("SMILES TOO LONG")
+    len_smiles = len(smiles)
+    if len_smiles > Compound._meta.get_field("smiles").max_length:
+        logger.warning("SMILES too long (%s) [%d]", smiles, len_smiles)
         return None
-    if not len(inchi) > 255:
+    len_inchi = len(inchi)
+    if len_inchi <= 255:
         cpd_object.inchi = inchi
     else:
-        print("INCHI TOO LONG")
+        logger.warning("INCHI too long (%s) [%d]", inchi, len_inchi)
         return None
-    m = sanitized_mol
 
+    m = sanitized_mol
     if m is None:
-        sys.stderr.write("NONE MOLECULE PRODUCED\n" + smiles + "\n" + inchi)
+        msg = "NONE MOLECULE PRODUCED\n" + smiles + "\n" + inchi
+        sys.stderr.write(msg)
+        logger.warning(msg)
         return None
+
     cpd_object.mol_log_p = Chem.Crippen.MolLogP(m)
     cpd_object.mol_wt = float(Chem.rdMolDescriptors.CalcExactMolWt(m))
     cpd_object.heavy_atom_count = Chem.Lipinski.HeavyAtomCount(m)
@@ -275,7 +297,7 @@ def calc_cpd(cpd_object, mol, projects):
 
 def update_cpd(cpd_id, mol, projects):
     """Update compound"""
-    print(mol)
+    logger.debug("update_cpd(%s, %s, ...)", cpd_id, mol)
     cpd = cpd_id
     comp = calc_cpd(cpd, mol, projects)
     return comp
@@ -295,20 +317,22 @@ def add_comp(mol, projects):
     return comp
 
 
-def add_mol(mol_sd, prot, projects, lig_id="LIG", chaind_id="Z", occupancy=0.0):
+def add_mol(mol_file, prot, projects, lig_id="LIG", chaind_id="Z",
+            occupancy=0.0, sdf_file=None):
     """Function to add a new Molecule to the database
 
-    :param mol_sd: the SDMolBlock of the molecule
+    :param mol_file: the file containing the SDMolBlock of the molecule
     :param prot: the protein it is associated to
     :param projects: the projects it is associated to
     :param lig_id: the 3 letter ligand id
     :param chaind_id: the chain id
     :param occupancy: the occupancy
+    :param sdf_file: SDF file if provided
     :return: the created molecule
     """
     # create mol object from mol_sd
-    rd_mol = Chem.MolFromMolFile(mol_sd)
-    orig_mol_block = open(mol_sd, 'r').read()
+    rd_mol = Chem.MolFromMolFile(mol_file)
+    orig_mol_block = open(mol_file, 'r').read()
 
     if rd_mol is None:
         return None
@@ -316,7 +340,7 @@ def add_mol(mol_sd, prot, projects, lig_id="LIG", chaind_id="Z", occupancy=0.0):
     # See if there is already a molecule with a compound
     old_mols = Molecule.objects.filter(prot_id=prot)
 
-    print('OLD MOLS = ' + str(len(old_mols)))
+    logger.debug('len(old_mols)=%d', len(old_mols))
     # If there's only one
     if len(old_mols) == 1:
         # find the right id (if it exists)
@@ -345,6 +369,13 @@ def add_mol(mol_sd, prot, projects, lig_id="LIG", chaind_id="Z", occupancy=0.0):
         # correct molecule. I.e. if it fails where does it go???
         # Now link that compound back
         new_mol.cmpd_id = comp_ref
+
+        # Save actual sdf file.
+        if sdf_file:
+            new_mol.sdf_file.save(
+                os.path.basename(sdf_file),
+                File(open(sdf_file))
+            )
         new_mol.save()
         return new_mol
     else:
@@ -476,6 +507,7 @@ def get_create_projects(target, proposal_ref):
     for fedid in proposal_ref.split()[1:]:
         user = User.objects.get_or_create(username=fedid, password="")[0]
         project.user_id.add(user)
+    target.upload_progess = 10.00
     target.save()
 
     return projects
@@ -491,9 +523,9 @@ def remove_not_added(target, xtal_list):
     """
     all_prots = Protein.objects.filter(target_id=target)
     # make sure not to delete any of the computed set proteins (which are protected)
-    computed_prots = [mol.pdb for mol in ComputedMolecule.objects.filter(pdb__target_id=target)] 
-    unprotected = [x for x in all_prots if x not in computed_prots] 
-    
+    computed_prots = [mol.pdb for mol in ComputedMolecule.objects.filter(pdb__target_id=target)]
+    unprotected = [x for x in all_prots if x not in computed_prots]
+
     for prot in unprotected:
         # Code consists of 'directory:alternate_name' if exists (code is renamed based on the metadata)
         code_first_part = prot.code.split(":")[0]
@@ -515,7 +547,7 @@ def save_confidence(mol, file_path, annotation_type="ligand_confidence"):
                 mol_annot.annotation_text = value
                 mol_annot.save()
         else:
-            print(val + " not found in " + str(input_dict) + " for mol " + str(mol.prot_id.code))
+            logger.warning("%s not found in %s for mol %s", val, input_dict, mol.prot_id.code)
 
 
 def load_from_dir(new_target, projects, aligned_path):
@@ -541,24 +573,28 @@ def load_from_dir(new_target, projects, aligned_path):
         mols_loaded += 1
         if not os.path.isdir(os.path.join(aligned_path, xtal)):
             continue
-        print(xtal)
+        logger.debug("%s", xtal)
         xtal_list.append(xtal)
         xtal_path = os.path.join(aligned_path, xtal)
 
         pdb_file_path = get_path_or_none(xtal_path, xtal, input_dict, "APO")
         mol_file_path = get_path_or_none(xtal_path, xtal, input_dict, "MOL")
+        sdf_file_path = get_path_or_none(xtal_path, xtal, input_dict, "SDF")
         code = pdb_file_path.split('/')[-1].rsplit("_", 1)[0]
 
         if pdb_file_path:
             new_prot = add_prot(code=code, target=new_target, xtal_path=xtal_path, xtal=xtal, input_dict=input_dict)
             new_prot.save()
         if mol_file_path:
-            new_mol = add_mol(mol_file_path, new_prot, projects)
+            new_mol = add_mol(mol_file_path, new_prot, projects,
+                              sdf_file=sdf_file_path)
             if new_mol:
                 new_mol.save()
 
     # Remove proteins for crystals that are not part of the library
     remove_not_added(new_target, xtal_list)
+    new_target.upload_progess = 50.00
+    new_target.save()
 
     return mols_loaded
 
@@ -597,7 +633,7 @@ def get_vectors(mols):
     vect_types = VectTypes()
     for mol in mols:
         if "." in mol.smiles:
-            print("SKIPPING - FRAGMENT: " + str(mol.smiles))
+            logger.debug("SKIPPING - FRAGMENT: %s", mol.smiles)
             continue
         vectors = get_3d_vects_for_mol(mol.sdf_info)
         for vect_type in vectors:
@@ -613,6 +649,32 @@ def get_vectors(mols):
                     smiles=smiles, cmpd_id=mol.cmpd_id, type=vect_choice
                 )[0]
                 create_vect_3d(mol, new_vect, vect_ind, vectors[vect_type][vector])
+
+
+def search_for_molgroup_by_coords(coords, target):
+    """search for a molgroup by list of coordinates"""
+
+    x = coords[0]
+    y = coords[1]
+    z = coords[2]
+
+    limit_list = []
+
+    for coord in x, y, z:
+        lower, upper = get_coord_limits(coord)
+        limit_list.append([lower, upper])
+
+    search = MolGroup.objects.filter(target_id__title=target, x_com__gte=limit_list[0][0], x_com__lte=limit_list[0][1],
+                                     y_com__gte=limit_list[1][0], y_com__lte=limit_list[1][1],
+                                     z_com__gte=limit_list[2][0],
+                                     z_com__lte=limit_list[2][1])
+
+    if len(search) == 1:
+        mol_group = search[0]
+    else:
+        return None
+
+    return mol_group
 
 
 def cluster_mols(rd_mols, mols, target):
@@ -673,12 +735,12 @@ def centre_of_mass(mol):
     return center_of_mass
 
 
-def process_site(rd_mols):
-    """process site"""
+def calc_site_centre(rd_mols):
+    """Calculate the centre of the site's molecules based on the centre of mass"""
 
     coms = [centre_of_mass(mol) for mol in rd_mols]
     centre = centre_of_points(coms)
-    print('CENTRE: ' + str(centre))
+    logger.debug('CENTRE: %s', centre)
     return centre
 
 
@@ -695,41 +757,17 @@ def get_coord_limits(coord):
     return lower_limit, upper_limit
 
 
-def search_for_molgroup_by_coords(coords, target):
-    """search for a molgroup by list of coordinates"""
-
-    x = coords[0]
-    y = coords[1]
-    z = coords[2]
-
-    limit_list = []
-
-    for coord in x, y, z:
-        lower, upper = get_coord_limits(coord)
-        limit_list.append([lower, upper])
-
-    search = MolGroup.objects.filter(target_id__title=target, x_com__gte=limit_list[0][0], x_com__lte=limit_list[0][1],
-                                     y_com__gte=limit_list[1][0], y_com__lte=limit_list[1][1],
-                                     z_com__gte=limit_list[2][0],
-                                     z_com__lte=limit_list[2][1])
-
-    if len(search) == 1:
-        mol_group = search[0]
-    else:
-        return None
-
-    return mol_group
-
-
 def search_for_molgroup_by_description(description, target):
     """search for a molgroup by description"""
 
     search = MolGroup.objects.filter(target_id__title=target, description=description)
-    print(str('matching_sites = ')+str(len(search)))
+    logger.debug("len(search)=%d", len(search))
     if len(search) == 1:
         mol_group = search[0]
 
     elif len(search) > 1:
+        # Note that this will also set the mol_group in the  MoleculeTag
+        # objects fot this mol_group to null.
         for molgroup in search:
             molgroup.delete()
         return None
@@ -739,8 +777,72 @@ def search_for_molgroup_by_description(description, target):
     return mol_group
 
 
+def specifc_site(rd_mols, mols, target, site_description=None):
+    """ Update/Create mol_groups and molecule_tags with site information
+    :param rd_mols: the molecules to add to the site (rd form)
+    :param mols: the molecules to add to the site
+    :param target: the Django target
+    :param site_description:
+    :return: None
+    """
+
+    # look for molgroup with same target and description
+    mol_group = search_for_molgroup_by_description(target=target.title,
+                                                   description=site_description)
+
+    if not mol_group:
+        mol_group = MolGroup()
+
+    mol_group.group_type = "MC"
+    mol_group.target_id = target
+    centre = calc_site_centre(rd_mols)
+    mol_group.x_com = centre[0]
+    mol_group.y_com = centre[1]
+    mol_group.z_com = centre[2]
+    mol_group.description = site_description
+    mol_group.save()
+
+    # A molecule tag record may exist already, but won't the first time the
+    # target is loaded.
+
+    try:
+        mol_tag = MoleculeTag.objects.get(tag=site_description,
+                                          target_id=target.id)
+    except MoleculeTag.DoesNotExist:
+        mol_tag = None
+
+    if not mol_tag:
+        # New site/tag or the tag has been deleted
+        mol_tag = MoleculeTag()
+        mol_tag.tag = site_description
+        mol_tag.category = TagCategory.objects.get(category='Sites')
+        mol_tag.target = target
+        mol_tag.mol_group = mol_group
+        mol_tag.save()
+    else:
+        # Tag already exists
+        # Apart from the new mol_group and molecules, we shouldn't be
+        # changing anything.
+        mol_tag.mol_group = mol_group
+        mol_tag.save()
+
+    ids = [m.id for m in mols]
+    print([a['id'] for a in mol_group.mol_id.values()])
+
+    for mol_id in ids:
+        if mol_id not in [a['id'] for a in mol_group.mol_id.values()]:
+            logger.debug("mol_group mol_id=%s", mol_id)
+            this_mol = Molecule.objects.get(id=mol_id)
+            mol_group.mol_id.add(this_mol)
+
+        if mol_id not in [a['id'] for a in mol_tag.molecules.values()]:
+            logger.debug("mol_tag mol_id=%s", mol_id)
+            this_mol = Molecule.objects.get(id=mol_id)
+            mol_tag.molecules.add(this_mol)
+
+
 def analyse_mols(mols, target, specified_site=False, site_description=None):
-    """Analyse a list of molecules for a given target
+    """Check if molecules belong to a cluster or a specific site for a given target
 
     :param mols: the Django molecules to analyse
     :param target: the Django target
@@ -750,35 +852,9 @@ def analyse_mols(mols, target, specified_site=False, site_description=None):
     """
     rd_mols = [Chem.MolFromMolBlock(x.sdf_info) for x in mols]
     if not specified_site:
-
         cluster_mols(rd_mols, mols, target)
-
     else:
-
-        centre = process_site(rd_mols)
-
-        # look for molgroup with same target and description
-        mol_group = search_for_molgroup_by_description(target=target.title, description=site_description)
-
-        if not mol_group:
-            mol_group = MolGroup()
-        mol_group.group_type = "MC"
-        mol_group.target_id = target
-        mol_group.x_com = centre[0]
-        mol_group.y_com = centre[1]
-        mol_group.z_com = centre[2]
-        mol_group.description = site_description
-        mol_group.save()
-
-        ids = [m.id for m in mols]
-
-        print([a['id'] for a in mol_group.mol_id.values()])
-
-        for mol_id in ids:
-            if mol_id not in [a['id'] for a in mol_group.mol_id.values()]:
-                print(mol_id)
-                this_mol = Molecule.objects.get(id=mol_id)
-                mol_group.mol_id.add(this_mol)
+        specifc_site(rd_mols, mols, target, site_description)
 
     get_vectors(mols)
 
@@ -797,7 +873,7 @@ def rename_proteins(names_csv):
 
         prots = Protein.objects.filter(code=mol_target)
         for prot in prots:
-            print('changing prot name to: ' + new_name)
+            logger.debug("Changing prot.code to '%s'", new_name)
             prot.code = new_name
             prot.save()
 
@@ -808,7 +884,7 @@ def relative_to_media_root(filepath, media_root=settings.MEDIA_ROOT):
     return relative_path
 
 
-def analyse_target(target_name, aligned_path):
+def analyse_target(target, aligned_path):
     """Analyse all the molecules for a particular target.
 
     param: target_name (str): the string title of the target. This will uniquely identify it.
@@ -818,7 +894,6 @@ def analyse_target(target_name, aligned_path):
     """
 
     # Get Target from database
-    target = Target.objects.get(title=target_name)
     target.root_data_directory = relative_to_media_root(aligned_path)
     target.save()
 
@@ -827,7 +902,7 @@ def analyse_target(target_name, aligned_path):
     # This can probably be improved to count molecules as they are processed when the code is further refactored
     mols_processed = len(mols)
 
-    print("Analysing " + str(len(mols)) + " molecules for " + target_name)
+    logger.debug("Analysing '%s' molecules for '%s'", len(mols), target.title)
 
     # Do site mapping
     if os.path.isfile(os.path.join(aligned_path, 'metadata.csv')):
@@ -893,21 +968,23 @@ def analyse_target(target_name, aligned_path):
         sites = pd.read_csv(os.path.join(aligned_path, 'sites.csv'))
         sites.sort_values(by='site', inplace=True)
 
-        # delete the old molgroups first
-        mgs = MolGroup.objects.filter(target_id=target)
-        for m in mgs:
+        # Delete the old mol_groups
+        # Note that this will not delete associated MoleculeTags - the tags
+        # will have their mol_group set to Null, but be left on the
+        # database so that any existing Tags will not be broken.
+        mol_groups = MolGroup.objects.filter(target_id=target)
+        for m in mol_groups:
             m.delete()
 
         for _, row in sites.iterrows():
             description = row['site']
             number = row['id']
-            print('Processing user input site: ' + str(description))
+            logger.debug('Processing user input site: %s', description)
             matches = []
             for _, row in hits_sites.iterrows():
                 if str(row['site_number']) == str(number):
                     matches.append(row['crystal_id'])
-            print('HIT IDS: ' + str(matches))
-            print('\n')
+            logger.debug('HIT IDS: %s', matches)
             if matches:
                 mols = list(Molecule.objects.filter(prot_id__target_id=target, prot_id__code__in=matches))
                 analyse_mols(mols=mols, target=target, specified_site=True, site_description=description)
@@ -924,7 +1001,8 @@ def analyse_target(target_name, aligned_path):
     for f in files:
         shutil.move(os.path.join(aligned_path, f), os.path.join(aligned_path, f).replace('aligned', ''))
 
-    # delete NEW_DATA VISITS PROPOSALS. These are not used by the new loader but might be in old data sets.
+    # delete NEW_DATA VISITS PROPOSALS. These are not used by the new loader but might be in
+    # old data sets.
     to_delete = ['NEW_DATA', 'VISITS', 'PROPOSALS']
     for file in to_delete:
         filepath = os.path.join(aligned_path.replace('aligned', ''), file)
@@ -933,8 +1011,8 @@ def analyse_target(target_name, aligned_path):
 
     # last step - zip up the input file and move it to the archive
     zipped = shutil.make_archive(aligned_path.replace('aligned', ''), 'zip', aligned_path.replace('aligned', ''))
-    # shutil.move(zipped, os.path.join(settings.MEDIA_ROOT, 'targets', os.path.basename(zipped)))
     target.zip_archive.name = relative_to_media_root(zipped)
+
     target.save()
 
     return mols_processed
@@ -968,7 +1046,7 @@ def process_target(new_data_folder, target_name, proposal_ref):
     if os.path.isdir(target_upload_path):
         shutil.rmtree(target_upload_path)
 
-    print('Saving uploaded data to ' + upload_path)
+    logger.info("Saving uploaded data to '%s'",  upload_path)
     # move the whole folder from the upload directory to the media directory
     # This creates the initial data in the aligned directory.
     shutil.move(target_path, upload_path)
@@ -976,11 +1054,16 @@ def process_target(new_data_folder, target_name, proposal_ref):
     # change the target_path to the new 'aligned' directory
     aligned_path = os.path.join(upload_path, target_name, 'aligned')
 
-    print('ALIGNED_PATH: ' + aligned_path)
+    logger.info("aligned_path='%s'", aligned_path)
     # Check if there is any data to process
     if os.path.isdir(aligned_path):
         # Create the target if required
         new_target = get_create_target(target_name)
+
+        # Set status to Processing
+        new_target.upload_status="STARTED"
+        new_target.upload_progess=0.00
+        new_target.save()
 
         # Create a project attached to the target with proposal/visit information if it exists.
         projects = get_create_projects(new_target, proposal_ref)
@@ -990,9 +1073,14 @@ def process_target(new_data_folder, target_name, proposal_ref):
 
         # This updates files like metadata.csv, alternatename.csv, hits_ids.csv etc.
         if mols_loaded:
-            mols_processed = analyse_target(target_name, aligned_path)
+            mols_processed = analyse_target(new_target, aligned_path)
+
+        new_target.upload_status="SUCCESS"
+        new_target.upload_progess=100.00
+        new_target.upload_datetime=datetime.datetime.now(datetime.timezone.utc)
+        new_target.save()
     else:
-        print("Aligned folder is missing - no data to add: " + aligned_path)
+        logger.warning("aligned_path is missing - no data to add (%s)", aligned_path)
 
     return mols_loaded, mols_processed
 
@@ -1003,6 +1091,7 @@ def add_tset_warning(validate_dict, location, error, line_number):
     validate_dict['Error'].append(error)
     validate_dict['Line number'].append(line_number)
     return validate_dict
+
 
 def check_meatadata_row(validated, input_validate_dict, row, idx):
     """Validate the metadata.csv file to check basic formatting is correct

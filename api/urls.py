@@ -73,6 +73,21 @@ router.register(r"discourse_post", viewer_views.DiscoursePostView, basename='dis
 # Take a dictionary and return a csv
 router.register(r"dicttocsv", viewer_views.DictToCsv, basename='dicttocsv')
 
+# tags
+router.register(r"tag_category", viewer_views.TagCategoryView, basename='tag_category')
+router.register(r"molecule_tag", viewer_views.MoleculeTagView, basename='molecule_tag')
+router.register(r"session_project_tag", viewer_views.SessionProjectTagView, basename='session_project_tag')
+router.register(r"target_molecules", viewer_views.TargetMoleculesView, basename='target_molecules')
+
+# Download a zip file of the requested contents
+router.register(r"download_structures", viewer_views.DownloadStructures, basename='download_structures')
+
+# Squonk Jobs
+router.register(r"job_file_transfer", viewer_views.JobFileTransferView, basename='job_file_transfer')
+router.register(r"job_request", viewer_views.JobRequestView, basename='job_request')
+router.register(r"job_callback", viewer_views.JobCallBackView, basename='job_callback')
+router.register(r"job_config", viewer_views.JobConfigView, basename='job_config')
+
 from rest_framework_swagger.renderers import OpenAPIRenderer, SwaggerUIRenderer
 from rest_framework.decorators import api_view, renderer_classes
 from rest_framework import response, schemas

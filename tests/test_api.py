@@ -1,7 +1,13 @@
 import json
+import zipfile
+import shutil
 
+from deepdiff import DeepDiff
 from django.contrib.auth.models import AnonymousUser, User
 from django.test import RequestFactory
+from django.core.management.color import no_style
+from django.db import connection
+
 from rest_framework.test import APIClient, APITestCase
 from rest_framework.test import APIRequestFactory
 
@@ -15,8 +21,29 @@ from hypothesis.models import (
     InteractionPoint,
     Interaction,
 )
-from viewer.models import Molecule, Protein, Target, Compound, Project
+from viewer.models import (
+    Molecule,
+    Protein,
+    Target,
+    Compound,
+    Project,
+    SessionProject,
+    TagCategory,
+    MoleculeTag,
+    SessionProjectTag
+)
 
+# Target upload functions
+from viewer.target_set_upload import (
+    validate_target,
+    process_target
+)
+
+# Compound set upload functions
+from viewer.tasks import (
+    validate_compound_set,
+    process_compound_set
+)
 
 # Test all these functions
 
@@ -204,6 +231,46 @@ class APIUrlsTestCase(APITestCase):
             map_info="my_hotspot.map",
         )
 
+        # Tags tests
+
+        # TagCategory - Should have been created by the migrations.
+        self.tagcategory = TagCategory.objects.get(id=1)
+
+        # MoleculeTag
+        self.moltag = MoleculeTag.objects.create(
+            id = 1,
+            tag = "A9 - XChem screen - covalent hits",
+            create_date = "2021-04-20T14:16:46.850313Z",
+            colour = "FFFFFF",
+            discourse_url = "www.discoursesite.com/t/1234",
+            help_text = "Some help text to display as a tooltip",
+            additional_info = "{'key', 'value'}",
+            category = self.tagcategory,
+            target = self.target,
+        )
+        self.moltag.molecules.add(self.mol)
+
+        # SessionProject created for SessionProjectTag
+        self.sp = SessionProject.objects.create(
+            id = 1,
+            title = 'test session project',
+            target = self.target
+        )
+
+        # SessionProjectTag
+        self.sptag = SessionProjectTag.objects.create(
+            id = 1,
+            tag = "Session Project Tag",
+            create_date = "2021-04-20T14:16:46.850313Z",
+            colour = "FFFFFF",
+            discourse_url = "www.discoursesite.com/t/1234",
+            help_text = "Some help text to display as a tooltip",
+            additional_info = "{'key', 'value'}",
+            category = self.tagcategory,
+            target = self.target,
+        )
+        self.sptag.session_projects.add(self.sp)
+
         self.url_base = "/api"
 
         self.get_types = ["targets"] #, "molecules"]
@@ -215,22 +282,26 @@ class APIUrlsTestCase(APITestCase):
                 "previous": None,
                 "results": [
                     {
-                        "id": 1,
-                        "title": "DUMMY_TARGET",
-                        "project_id": [1],
-                        "protein_set": [1],
-                        "template_protein": "/media/my_pdb.pdb",
-                        "metadata": None,
-                        "zip_archive": None,
-                        "sequences": [{'chain': '', 'sequence': ''}]
-                    },
-                    {
                         "id": 2,
                         "title": "SECRET_TARGET",
                         "project_id": [2],
                         "protein_set": [2],
+                        "default_squonk_project": None,
                         "template_protein": "/media/secret_pdb.pdb",
                         "metadata": None,
+                        "upload_status": None,
+                        "zip_archive": None,
+                        "sequences": [{'chain': '', 'sequence': ''}]
+                    },
+                    {
+                        "id": 1,
+                        "title": "DUMMY_TARGET",
+                        "project_id": [1],
+                        "protein_set": [1],
+                        "default_squonk_project": None,
+                        "template_protein": "/media/my_pdb.pdb",
+                        "metadata": None,
+                        "upload_status": None,
                         "zip_archive": None,
                         "sequences": [{'chain': '', 'sequence': ''}]
                     },
@@ -394,8 +465,10 @@ class APIUrlsTestCase(APITestCase):
                         "title": "DUMMY_TARGET",
                         "project_id": [1],
                         "protein_set": [1],
+                        'default_squonk_project': None,
                         "template_protein": "/media/my_pdb.pdb",
                         "metadata": None,
+                        'upload_status': None,
                         "zip_archive": None,
                         "sequences": [{'chain': '', 'sequence': ''}]
                     }
@@ -556,8 +629,10 @@ class APIUrlsTestCase(APITestCase):
                 "title": "DUMMY_TARGET",
                 "project_id": [1],
                 "protein_set": [1],
+                "default_squonk_project": None,
                 "template_protein": "/media/my_pdb.pdb",
                 "metadata": None,
+                "upload_status": None,
                 "zip_archive": None,
                 "sequences": [{'chain': '', 'sequence': ''}]
             },
@@ -575,6 +650,9 @@ class APIUrlsTestCase(APITestCase):
                 "sigmaa_info": None,
                 "diff_info": None,
                 "event_info": None,
+                "trans_matrix_info": None,
+                "pdb_header_info": None,
+                "apo_desolve_info": None,
                 "aligned": None,
                 "has_eds": None,
                 "aligned_to": None
@@ -641,10 +719,9 @@ class APIUrlsTestCase(APITestCase):
                 self.client.force_authenticate(user)
             response = self.client.get(self.url_base + "/" + get_type + "/")
             self.assertEqual(response.status_code, 200)
-            self.assertDictEqual(
-                json.loads(json.dumps(response.json(), sort_keys=True)),
-                json.loads(json.dumps(test_data_set[get_type], sort_keys=True)),
-            )
+            a = json.loads(json.dumps(response.json()))
+            b = json.loads(json.dumps(test_data_set[get_type]))
+            self.assertFalse(DeepDiff(a, b, ignore_order=True))
 
     def test_secure(self):
         # Test the login user  can access secure data
@@ -655,3 +732,156 @@ class APIUrlsTestCase(APITestCase):
 
     def test_not_logged_in(self):
         self.do_full_scan(None, self.not_secret_target_data)
+
+    def test_tags(self):
+        """
+        Check basic tag functionality works.
+        The data is created in the setUp(self) method
+        This could be expanded to include all the session project/snapshot stuff
+        when budget/opportunity allows.
+        :return:
+        """
+        urls = [
+            "tag_category",
+            "molecule_tag",
+            "session_project_tag"
+        ]
+        response_data = [
+            {
+                "id": 1,
+                "category": "Sites",
+                "colour": "00CC00",
+                "description": None
+            },
+            {
+                "id": 1,
+                "tag": "A9 - XChem screen - covalent hits",
+                "user": None,
+                "mol_group": None,
+                "create_date": "2021-04-20T14:16:46.850313Z",
+                "colour": "FFFFFF",
+                "discourse_url": "www.discoursesite.com/t/1234",
+                "help_text": "Some help text to display as a tooltip",
+                "additional_info": "{'key', 'value'}",
+                "category": 1,
+                "target": 1,
+                "molecules": [1]
+            },
+            {
+                "id": 1,
+                "tag": "Session Project Tag",
+                "user": None,
+                "create_date": "2021-04-20T14:16:46.850313Z",
+                "colour": "FFFFFF",
+                "discourse_url": "www.discoursesite.com/t/1234",
+                "help_text": "Some help text to display as a tooltip",
+                "additional_info": "{'key', 'value'}",
+                "category": 1,
+                "target": 1,
+                "session_projects": [1]
+            },
+        ]
+        self.client.login(username=self.user.username, password=self.user.password)
+        for i, url in enumerate(urls):
+            # GET same data
+            response = self.client.get(self.url_base + "/" + url + "/1/")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, response_data[i])
+
+    def test_validate_target(self):
+
+        target_zip = '/code/tests/test_data/TESTTARGET.zip'
+        new_data_folder = '/code/tests/output/new_data'
+        target = 'TESTTARGET'
+        proposal = 'open'
+
+        # This will create the target folder in the tmp/ location.
+        with zipfile.ZipFile(target_zip, 'r') as zip_ref:
+            zip_ref.extractall(new_data_folder)
+
+        validated, validate_dict = validate_target(new_data_folder,
+                                                   target,
+                                                   proposal)
+        self.assertEqual(validated, True)
+        self.assertEqual(validate_dict, {'Location': [], 'Error': [], 'Line number': []})
+        # Tidy up data if not validated
+        if not validated:
+            shutil.rmtree(new_data_folder)
+
+
+    def test_process_target(self):
+
+        # Reset the autoincrement keys from the tests above so the target
+        # can be loaded.
+        models = [Target, Project, Molecule, Protein,
+                  Compound, MoleculeTag, Vector, Vector3D]
+        sequence_sql = connection.ops.sequence_reset_sql(no_style(), models)
+
+        with connection.cursor() as cursor:
+            for sql in sequence_sql:
+                cursor.execute(sql)
+
+        target_zip = '/code/tests/test_data/TESTTARGET.zip'
+        new_data_folder = '/code/tests/output/new_data'
+        target = 'TESTTARGET'
+        proposal = 'open'
+
+        # This will create the target folder in the tmp/ location.
+        with zipfile.ZipFile(target_zip, 'r') as zip_ref:
+            zip_ref.extractall(new_data_folder)
+
+        mols_loaded, mols_processed = process_target(new_data_folder,
+                                                     target,
+                                                     proposal)
+
+        # Improve checks as we understand more how it works.
+        self.assertEqual(mols_loaded, 8)
+        self.assertEqual(mols_processed, 7)
+        target =  Target.objects.filter(title='TESTTARGET').values()
+        self.assertEqual(len(target), 1)
+        # Check finished successfully.
+        self.assertEqual(target[0]['upload_status'], 'SUCCESS')
+        proteins =  Protein.objects.filter(target_id__title='TESTTARGET').values()
+        self.assertEqual(len(proteins), 7)
+        # Selection of files are currently saved.
+        for protein in proteins:
+            self.assertNotEqual(protein['pdb_info'], '')
+            self.assertNotEqual(protein['bound_info'], '')
+            self.assertNotEqual(protein['trans_matrix_info'], '')
+            self.assertNotEqual(protein['apo_desolve_info'], '')
+            self.assertEqual(protein['pdb_header_info'], '')
+
+        # Matches the number of proteins
+        molecules =  Molecule.objects.filter(prot_id__target_id__title='TESTTARGET').values()
+        self.assertEqual(len(molecules), 7)
+
+        # Matches the number of sites in Metadata.csv
+        tags = MoleculeTag.objects.filter(target__title='TESTTARGET').values()
+        self.assertEqual(len(tags), 3)
+
+        # Tidy up data
+        shutil.rmtree(new_data_folder)
+
+
+    # def test_computed_set(self):
+    #     # NOTE THIS IS COMMENTED OUT BECAUSE compund-set_test.sdf DOES NOT YET HAVE CORRECT
+    #     # REF_MOLS. I TOOK IT FROM AN MPRO BASED SOURCE FILE (RATHER THAN THE CD44-BASED STUFF
+    #     # IN THE TESTTARGET) AND SO SOME CHANGES NEED TO BE MADE). IT MAY ALSO BE THAT
+    #     # TESTTARGET.zip HAS TO BE MODIFIED TO HAVE PROTEIN CODE CONSISTENT WITH THE TARGET NAME.
+    #
+    #     sdf_file = \
+    #         '/code/tests/test_data/compund-set_test.sdf'
+    #     target = 'TESTTARGET'
+    #
+    #     # Check validate step
+    #     validate_output = validate_compound_set(self.user.id, sdf_file, target=target)
+    #
+    #     # Check if SDF validated
+    #     print(validate_output)
+    #     self.assertEqual(validate_output[3], True)
+    #     self.assertEqual(validate_output[0], 'validate')
+    #     self.assertEqual(validate_output[1], 'cset')
+    #
+    #     # Check process step -
+    #     process_output = process_compound_set(validate_output)
+    #     print(process_output)
